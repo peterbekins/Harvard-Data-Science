@@ -1,2 +1,2 @@
 # Harvard-Data-Science
-R projects for Harvard data science courses on EdX
+This repository contains R projects that were completed for Harvard data science courses that were offered on EdX.
