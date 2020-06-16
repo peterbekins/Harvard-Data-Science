@@ -1,0 +1,362 @@
+---
+title: "Titanic Machine Learning Models"
+output:
+  html_document:
+    df_print: paged
+---
+# Introduction
+
+This notebook applies machine learning approaches to the classic Titanic Passenger Survival Data Set (titanic). The steps follow the Titanic Exercises in section 5.3 of the HarvardX course PH125.8x Data Science: Machine Learning. (Note especially that seeds are set in order to match the expected output in the course materials).
+
+## Load Data and Packages
+
+The following R packages are necessary. 
+
+```{r}
+library(titanic)  
+library(caret)
+library(tidyverse)
+library(rpart)
+library(randomForest)
+```
+
+## Inspect Data
+
+The titanic package includes separate test and train data. The models in this notebook will be applied to the training set, which includes 891 observations and 12 variables. A summary of the variables is shown below. 
+
+```{r}
+print(summary(titanic_train))
+```
+
+The Survived category represents the outcome that we will be predicting. Note that the mean 0.3838 represents the proportion of passengers that survived. Note also that the Age column includes 177 NA's, which will need to be replaced.
+
+## Clean Data
+
+Four tasks are completed to clean the data: 
+
+1. The Survived (Passenger Survival Indicator) and Embarked (Port of Embarkation) columns are transformed into factors.
+2. The NA's in the Age column are replaced by the median. 
+3. The SibSp (Number of Siblings/Spouses Aboard) and Parch (Number of Parents/Children Aboard) columns are combined (+1 for the passenger) into a new metric called FamilySize . 
+4. A subset of eight variables is selected for modelling (PassengerId, Name, Ticket, and Cabin are dropped).
+
+```{r}
+titanic_clean <- titanic_train %>%
+  mutate(Survived = factor(Survived),
+         Embarked = factor(Embarked),
+         Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age), # NA age to median age
+         FamilySize = SibSp + Parch + 1) %>%    # count family members
+  select(Survived,  Sex, Pclass, Age, Fare, SibSp, Parch, FamilySize, Embarked)
+```
+
+## Partition Data
+
+In order to test the models, train_data will itself be split 80/20 into two new dataframes, train_set and test_set. Each model will be fit to train_set and tested for accuracy on test_set.
+
+```{r}
+set.seed(42, sample.kind="Rounding")
+test_index <- createDataPartition(titanic_clean$Survived, times = 1, p = 0.2, list = FALSE)
+test_set <- titanic_clean[test_index, ]
+train_set <- titanic_clean[-test_index, ]
+y <- test_set$Survived     # Reference outcomes for testing
+```
+
+## Guessing?
+
+Before training true machine learning models, we can set a baseline for performance by simply guessing whether each passenger survived or not. 
+
+```{r}
+set.seed(3, sample.kind="Rounding")
+y_hat_guess <- sample(c(0, 1), length(test_index), replace = TRUE) %>% 
+  factor(levels = levels(y))
+cm_guess <-confusionMatrix(data = y_hat_guess, reference = y)
+```
+
+The accuracy of guessing is less than 50%. 
+
+```{r}
+cm_guess$overall["Accuracy"]
+```
+
+# Building and Testing Models
+
+In this section we will train several models. We will begin with a simple linear model using only one variable and slowly increase complexity. 
+
+## Women and Children First?
+
+As we develop our model, a reasonable starting point is to assume that survival rates are strongly related to the variables Sex and Age. We will begin with Sex, as it is a simple categorical variable. As summarized below, the survival rate (Rate) does correlate strongly with gender in the train set--over 70% of female passengers survived compared to just under 20% of male passengers.
+
+```{r}
+train_set %>% group_by(Sex) %>% summarize(Rate = mean(Survived==1))
+```
+
+The following model predicts survival based solely on gender (if female y = 1, else y = 0).
+
+```{r}
+y_hat_gender <- ifelse(test_set$Sex == "female", 1, 0) %>% factor(levels = levels(y))
+cm_gender <- confusionMatrix(data = y_hat_gender, reference = y)
+```
+
+The confusion matrix shows that false positives (14) and false negatives (18) are roughly equal.
+
+```{r}
+cm_gender$table
+```
+
+The accuracy of this simple model is 0.821.
+
+```{r}
+cm_gender$overall["Accuracy"]
+```
+
+## Passenger Class
+
+Before thinking about Age, which is a continuous variable, we can add passenger class (Pclass) to the model. Pclass is also a simple categorical variable (1, 2, or 3), which seems to be a relatively strong predictor of survival when combined with gender. As the following summary shows, over 90% of female passengers in classes 1 and 2 survived. 
+
+```{r}
+train_set %>% group_by(Sex, Pclass) %>% summarize(mean(Survived==1))
+```
+
+When this insight is added to the simple model, however, the accuracy remains 0.821. 
+
+```{r}
+y_hat_gender_class <- ifelse(test_set$Sex == "female" & (test_set$Pclass == 1 | test_set$Pclass == 2), 1, 0) %>% 
+  factor(levels = levels(y))
+cm_gender_class <- confusionMatrix(data = y_hat_gender_class, reference = y)
+cm_gender_class$overall["Accuracy"]
+```
+
+Moreover, there are other significant changes. The confusion matrix shows that we have virtually eliminated false positives (1) but at the cost of a significant increase in false negatives (31).
+
+```{r}
+cm_gender_class$table
+```
+
+This makes sense as we can predict survival for female passengers in classes 1 and 2 with great accuracy, but we are now predicting that female passengers in class 3 did not survive when half of them did. 
+
+As the following table shows, the sensitivity of the model is slightly increased by adding class, but specificity significantly decreases. 
+
+```{r}
+comp <- data.frame(Sensitivity = c(cm_gender$byClass["Sensitivity"], cm_gender_class$byClass["Sensitivity"]), Specificity = c(cm_gender$byClass["Specificity"], cm_gender_class$byClass["Specificity"]))
+rownames(comp) <- c("gender", "gender + class")
+print(comp)
+```
+
+## Age
+
+Age is a continuous variable with a range of 0.4 to 80 and a mean of 29.7. On the whole, Age does not seem to correlate to survival. 
+
+```{r}
+cor(as.numeric(train_set$Survived), train_set$Age)
+```
+
+The approximate relationship can be observed by grouping Ages into bins of approximately equal size. Note that only the youngest passengers (< 17) have a survival rate over 50%. 
+
+```{r}
+train_set %>% mutate(age_group = cut_number(Age, n = 8)) %>% group_by(age_group) %>% summarize(Rate = mean(Survived==1), Count = n())
+```
+
+We can try a logistic regression model (glm) to predict survival based on Age.
+
+```{r}
+set.seed(1, sample.kind="Rounding")
+train_age_glm <- train(Survived ~ Age, method = "glm", data = train_set)
+y_hat_age_glm <-  predict(train_age_glm, test_set)
+cm_age_glm <- confusionMatrix(data = y_hat_age_glm, reference = y)
+```
+
+But note that this model simply predicts that no passengers survived!
+
+```{r}
+cm_age_glm$table
+```
+
+The accuracy of the model is 0.615. (Remember the overall survival rate is .384).
+
+```{r}
+cm_age_glm$overall["Accuracy"]
+```
+
+## Fare
+
+Passenger fare (Fare) is a continuous variable that ranges from 0 to 528 with the average fare only 32. There is a slight correlation between Fare and passenger survival.
+
+```{r}
+cor(as.numeric(train_set$Survived), train_set$Fare)
+```
+
+For a quick view of the relationship, we can transform Fare into a categorical variable by grouping values into bins of approximately equal sizes. Note that the survival rate is only greater than 50% for the highest fare group (> 52).
+
+```{r}
+train_set %>% mutate(fare_group = cut_number(Fare, n = 6)) %>% group_by(fare_group) %>% summarize(Rate = mean(Survived==1), Count = n())
+```
+
+We will try two models for fare: linear discriminant analysis (lda) and quadratic discriminant analysis (qda). 
+
+```{r}
+# LDA Model
+train_lda <- train(Survived ~ Fare, method = "lda", data = train_set)
+y_hat_fare_lda <-  predict(train_lda, test_set)
+cm_fare_lda <- confusionMatrix(data = y_hat_fare_lda, reference = y)
+
+# QDA Model
+set.seed(1, sample.kind="Rounding")
+train_qda <- train(Survived ~ Fare, method = "qda", data = train_set)
+y_hat_fare_qda <-  predict(train_qda, test_set)
+cm_fare_qda <- confusionMatrix(data = y_hat_fare_qda, reference = y)
+```
+
+These models are basically identical, and result in the same low accuracy, 0.693.
+
+```{r}
+cm_fare_lda$table
+cm_fare_lda$overall["Accuracy"]
+```
+
+```{r}
+cm_fare_qda$table
+cm_fare_qda$overall["Accuracy"]
+```
+
+## Logistic Regression with Multiple Variables
+
+It is possible that a more accurate model could be built by considering multiple variables. The following model uses logistic regression with the four predictors we have explored to this point: Sex, Pclass, Fare, and Age.
+
+```{r}
+set.seed(1, sample.kind="Rounding")
+x_train <- train_set %>% select(Sex, Pclass, Fare, Age)
+y_train <- train_set$Survived
+train_glm_1 <- train(x_train, y_train, method = "glm")
+y_hat_glm_1 <-  predict(train_glm_1, test_set)
+cm_glm_1 <- confusionMatrix(data = y_hat_glm_1, reference = y)
+```
+
+The accuracy of the model is 0.849, which is our highest score to this point, and an F1 score of 0.879.
+```{r}
+cm_glm_1$overall["Accuracy"]
+cm_glm_1$byClass["F1"]
+```
+
+Note that the confusion matrix shows good balance between false negatives (12) and false positives (15). 
+
+```{r}
+cm_glm_1$table
+```
+
+Note that we do not gain any accuracy by adding the remaining variables to our logistic regression model, but the F1 score increases slightly.
+
+```{r include=FALSE}
+set.seed(1, sample.kind="Rounding")
+train_glm_2 <- train(Survived ~ ., method = "glm", data = train_set)
+y_hat_glm_2 <-  predict(train_glm_2, test_set)
+cm_glm_2 <- confusionMatrix(data = y_hat_glm_2, reference = y)
+```
+
+```{r}
+cm_glm_2$overall["Accuracy"]
+cm_glm_2$byClass["F1"]
+```
+
+## K-Nearest Neighbors
+
+We can also try a k-nearest neighbors (knn) model using all variables. We will try odd values of k between 3 and 51.
+
+```{r}
+set.seed(6, sample.kind="Rounding")
+train_knn <- train(Survived ~ ., method = "knn", tuneGrid = data.frame(k = seq(3, 51, 2)), data = train_set)
+y_hat_knn <-  predict(train_knn, test_set)
+cm_knn <- confusionMatrix(data = y_hat_knn, reference = y)
+```
+
+The model chose k = 11 as the optimal value.
+
+```{r}
+train_knn$bestTune
+```
+
+Unfortunately, this model is not an improvment over the logistic regression.
+
+```{r}
+cm_knn$overall["Accuracy"]
+cm_knn$byClass["F1"]
+```
+
+Adding 10-fold cross-validation results in an optimal k = 5 but accuracy falls to 0.648.
+
+```{r}
+set.seed(8, sample.kind="Rounding")
+control <- trainControl(method = "cv", number = 10, p = .9)
+train_knn_cv <- train(Survived ~ ., method = "knn", tuneGrid = data.frame(k = seq(3, 51, 2)), data = train_set, trControl = control)
+y_hat_knn_cv <-  predict(train_knn_cv, test_set)
+cm_knn_cv <- confusionMatrix(data = y_hat_knn_cv, reference = y)
+```
+
+```{r}
+cm_knn_cv$overall["Accuracy"]
+cm_knn_cv$byClass["F1"]
+```
+
+## Regression Trees
+
+A decision tree model can be built using regression trees (rpart). We will optimize the complexity parameter (cp) using values between 0 and 0.05. 
+
+```{r}
+set.seed(10, sample.kind="Rounding")
+train_rpart <- train(Survived ~ ., method = "rpart", tuneGrid = data.frame(cp = seq(0, 0.05, 0.002)), data = train_set)
+y_hat_rpart <-  predict(train_rpart, test_set)
+cm_rpart <- confusionMatrix(data = y_hat_rpart, reference = y)
+```
+
+The optimal value of cp was 0.016.
+
+```{r}
+train_rpart$bestTune
+```
+
+The regression tree model resulted in an accuracy of 0.838 with an F1 score of 0.870. Both of these are slightly lower than the logistic regression.
+
+```{r}
+cm_rpart$overall["Accuracy"]
+cm_rpart$byClass["F1"]
+```
+
+The decision tree of the final model can be plotted as below. Note that males are only predicted to survive if they are younger than 3.5, while females are predicted to survive if they are 1) in first or second class, or 2) have a fare price *under* $23.35. This result is slightly counter-intuitive as we might expect a higher fare to correlate with survival. 
+
+```{r}
+plot(train_rpart$finalModel, margin = 0.1)
+text(train_rpart$finalModel, cex = 0.75)
+```
+
+## Random Forest
+
+A decision tree can also be created using the random forest model. We will optimze the tuning parameter mtry with values between 1 and 7 and limit the number of trees (ntree) to 100.
+
+```{r}
+set.seed(14, sample.kind="Rounding")
+train_rf <- train(Survived ~ ., method = "rf", ntree = 100, tuneGrid = data.frame(mtry = 1:7), data = train_set)
+y_hat_rf <-  predict(train_rf, test_set)
+cm_rf <- confusionMatrix(data = y_hat_rf, reference = y)
+```
+
+The optimal value of mtry chosen by the model was 2.
+
+```{r}
+train_rf$bestTune
+```
+
+The random forest model resulted in an accuracy of 0.844 and an F1 score of 0.881.
+
+```{r}
+cm_rf$overall["Accuracy"]
+cm_rf$byClass["F1"]
+```
+
+Examining the variable importance shows that Sex, Fare, Age, and Pclass are the most significant.
+
+```{r}
+varImp(train_rf)
+```
+
+## Conclusion
+
+The best models seem to be logistic regression and random forest with F1 scores of.881. 
+ 
